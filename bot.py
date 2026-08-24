@@ -107,6 +107,29 @@ def _peer(category: dict, key, default="?"):
     return category.get("peer_stats", {}).get(key, default)
 
 
+def _template(kind: str, send_as: str, trigger: dict, sal: str) -> tuple:
+    """
+    Build a WhatsApp-template representation for the first outbound.
+    (We never call Meta — the brief says any sensible {{1}}/{{2}} structure is fine.)
+    template_params are the ordered dynamic slots; the rendered `body` is the filled form.
+    """
+    prefix = "vera" if send_as == "vera" else "merchant"
+    name = f"{prefix}_{kind}_v1"
+    params = [sal]
+    skip = {"category", "top_item_id", "digest_item_id", "item_id",
+            "merchant_id", "customer_id"}
+    for k, v in trigger.get("payload", {}).items():
+        if k in skip:
+            continue
+        if isinstance(v, (int, float)):
+            params.append(str(v))
+        elif isinstance(v, str) and v:
+            params.append(v)
+        if len(params) >= 4:
+            break
+    return name, params
+
+
 # --------------------------------------------------------------------------- #
 # Trigger handlers.  Each returns (body, cta, send_as).
 #   cta:      "binary" | "open_ended" | "booking" | "none"
@@ -590,10 +613,13 @@ def compose(category: dict, merchant: dict, trigger: dict,
     if hi and send_as == "vera" and body.endswith("YES to renew, STOP to pause."):
         pass  # already has a clear binary; leave English CTA which merchants parse fine
 
+    template_name, template_params = _template(kind, send_as, trigger, sal)
     result = {
         "body": body.strip(),
         "cta": cta,
         "send_as": send_as,
+        "template_name": template_name,
+        "template_params": template_params,
         "suppression_key": trigger.get("suppression_key")
         or f"{kind}:{merchant.get('merchant_id', '')}",
         "rationale": _rationale(kind, send_as, cta),

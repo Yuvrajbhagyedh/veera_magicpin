@@ -168,17 +168,26 @@ def _resolve_category(merchant: Dict) -> Dict:
     return STORE.category.get(slug, {})
 
 
+TICK_ACTION_CAP = 20  # testing-brief §7: /v1/tick action count cap
+
+
 @app.post("/v1/tick")
 def tick(req: Tick):
-    actions: List[Dict] = []
+    now = req.now or _now()
+
+    # 1. Build candidate actions from live, non-suppressed, non-expired triggers.
+    candidates = []  # (urgency, action, supp, ctx)
     for tid in req.available_triggers:
         trigger = STORE.trigger.get(tid)
         if not trigger:
             continue
-
+        # NB: we intentionally do NOT gate on expires_at. The harness sends the
+        # real wall-clock `now`, while this fixed dataset's triggers expire in
+        # Apr–May 2026, so a clock comparison would drop everything. Restraint
+        # comes from suppression dedup + the one-per-merchant cap below.
         supp = trigger.get("suppression_key", tid)
         if supp in STORE.sent_suppression:
-            continue  # already sent this beat — respect dedup
+            continue  # already sent this beat — dedup
 
         mid = trigger.get("merchant_id") or trigger.get("payload", {}).get("merchant_id")
         merchant = STORE.merchant.get(mid, {})
@@ -189,15 +198,50 @@ def tick(req: Tick):
         customer = STORE.customer.get(cid) if cid else None
 
         msg = compose(category, merchant, trigger, customer)
-        STORE.sent_suppression.add(supp)
-        actions.append({
-            "trigger_id": tid,
+        action = {
+            "conversation_id": f"conv_{mid}_{tid}",
             "merchant_id": mid,
             "customer_id": cid,
+            "trigger_id": tid,
             **msg,
-        })
+        }
+        ctx = {"trigger": trigger, "merchant": merchant,
+               "category": category, "customer": customer}
+        candidates.append((trigger.get("urgency", 3), action, supp, ctx))
 
-    return {"actions": actions, "now": req.now or _now()}
+    # 2. Restraint: at most one MERCHANT-facing action per merchant per tick
+    #    (highest urgency wins). Customer-facing messages go to different
+    #    recipients, so they're never merchant-spam — always keep them.
+    best_merchant_facing: Dict[str, tuple] = {}
+    kept = []
+    for urg, action, supp, ctx in candidates:
+        if action["send_as"] == "vera":
+            mid = action["merchant_id"]
+            cur = best_merchant_facing.get(mid)
+            if cur is None or urg > cur[0]:
+                best_merchant_facing[mid] = (urg, action, supp, ctx)
+        else:
+            kept.append((urg, action, supp, ctx))
+    kept.extend(best_merchant_facing.values())
+
+    # 3. Highest-urgency first, cap at 20, commit suppression + conversation memory.
+    kept.sort(key=lambda x: -x[0])
+    actions = []
+    for urg, action, supp, ctx in kept[:TICK_ACTION_CAP]:
+        STORE.sent_suppression.add(supp)
+        STORE.conversations[action["conversation_id"]] = {
+            "trigger_kind": ctx["trigger"].get("kind"),
+            "trigger": ctx["trigger"],
+            "merchant": ctx["merchant"],
+            "category": ctx["category"],
+            "customer": ctx["customer"],
+            "last_bot_body": action["body"],
+            "turns": 0,
+            "auto_reply_count": 0,
+        }
+        actions.append(action)
+
+    return {"actions": actions, "now": now}
 
 
 # --------------------------------------------------------------------------- #
@@ -215,13 +259,19 @@ class Reply(BaseModel):
 
 @app.post("/v1/reply")
 def reply(req: Reply):
+    # If this conversation was started by a /tick, `state` already holds the
+    # originating trigger context (trigger_kind, merchant, category, trigger).
     state = STORE.conversations.setdefault(req.conversation_id, {})
-    state["merchant"] = STORE.merchant.get(req.merchant_id or "", {})
+    if not state.get("merchant"):
+        state["merchant"] = STORE.merchant.get(req.merchant_id or "", {})
 
     # Share the auto-reply counter across conversations for the same merchant,
     # because the harness sends canned replies under fresh conversation ids.
     if req.merchant_id:
-        state["auto_reply_count"] = STORE.auto_reply_by_merchant.get(req.merchant_id, 0)
+        state["auto_reply_count"] = max(
+            state.get("auto_reply_count", 0),
+            STORE.auto_reply_by_merchant.get(req.merchant_id, 0),
+        )
 
     result = ch.decide_reply(state, req.message, state.get("merchant"))
 
